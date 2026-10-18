@@ -1,1 +1,457 @@
+//SarsijNayan
+/*********************************************************************
+ DARBHANGA LULC 1995 / 2005 / 2015 / 2025  -  VERSION 3 (Landsat only)
 
+ WHAT V3 CHANGES (after reviewing the V2 area table:
+ Built_Up 105 -> 324 -> 270 -> 280 km2, Water 3.5 -> 8.2 -> 4.1 -> 3.4 %)
+ 1. 2005 window is now 2005-2006 (V2 used 2004-2006). North Bihar had a
+    severe flood in 2004; flooded fields / wet silt look like Water and
+    Built_Up. That is the most likely reason 2005 is inflated. CHECK the
+    kharif scene count printed for 2005 and view the 2005 composite.
+ 2. Model comparison with BLOCK-wise (5 km) hold-out, RF vs Gradient Tree
+    Boost, with Built_Up and Water accuracy per epoch. Set MODEL below.
+ 3. TEMPORAL CONSISTENCY RULE for Built_Up (APPLY_TEMPORAL_RULE): built-up
+    does not normally disappear, so each pixel's 4 built/not-built labels are
+    replaced by the best-fitting non-decreasing series (weights favour the
+    newer, better imagery). Raw (before rule) areas are exported too.
+    NOTE: this guarantees Built_Up area never decreases BY CONSTRUCTION, so
+    judge the trend with your own validation points and GHSL, not the
+    rule's output alone.
+
+ (V2 text follows)
+ Fixes the "Built_Up decreasing after 2005" artifact of version 1.
+
+ WHAT WAS WRONG IN V1
+ - One model was trained only on 2020-22 imagery and applied backwards.
+   Landsat 5/7 pixels do not look like Landsat 8/9 pixels, and 1995/2005
+   composites are built from far fewer scenes (noisy) -> dry bare fields
+   were labelled Built_Up in old years (red speckle), while small rural
+   settlements were missed in 2015/2025 (only Darbhanga city survived).
+ - WorldCover "built-up" labels (pure 50 m blocks) only represent large
+   towns, so rural settlements were never learned.
+
+ WHAT V2 DOES
+ 1. POOLED, TIME-MATCHED TRAINING: samples are taken from the 1995, 2005,
+    2015 and 2020-22 composites, each with labels of ITS OWN date:
+      Built_Up   : GHSL built-surface epoch (1995/2005/2015/2020)
+      Water      : JRC Global Surface Water yearly history
+      Trees      : WorldCover 2021 tree AND Hansen tree cover 2000 AND no loss
+      Agriculture: WorldCover cropland, not built, not water at that date
+      Barren     : WorldCover bare/sparse (sandbars), not built, not water
+    One Random Forest learns all sensors/eras together.
+ 2. Extra phenology features (NDVI max/min/amplitude, built-up index) to
+    separate bare fields (big seasonal swing) from settlements (always dry).
+ 3. Per-epoch accuracy (esp. Built_Up user's/producer's) and a table that
+    compares your Built_Up area with GHSL for every year.
+ Class 6 "Other" = pixels with no valid observation (cloud-masked).
+
+ PIXEL VALUES: 1 Water_Wetlands, 2 Agriculture, 3 Built_Up,
+               4 Trees_Vegetation, 5 Barren_Fallow, 6 Other, 0 = outside AOI
+*********************************************************************/
+
+// ---------------------------- 0. SETTINGS ----------------------------
+var CRS = 'EPSG:32645';                  // UTM 45N for Darbhanga
+var DRIVE_FOLDER = 'Darbhanga_LULC_v3';
+var RUN_EXPORTS = true;
+var YEARS = [1995, 2005, 2015, 2025];
+
+var PERIODS = {                          // compositing windows [start, end)
+  1995: ['1994-01-01', '1997-01-01'],
+  2005: ['2005-01-01', '2007-01-01'],    // excludes the severe 2004 flood
+  2015: ['2014-01-01', '2017-01-01'],
+  2021: ['2020-01-01', '2023-01-01'],    // modern training epoch
+  2025: ['2024-01-01', '2026-01-01']
+};
+var SEASONS = {rabi: [1, 3], summer: [4, 6], kharif: [7, 10]};
+
+// Training epochs: image window year + the year of each reference label
+var EPOCHS = [
+  {y: 1995, ghsl: 1995, gsw: 1995},
+  {y: 2005, ghsl: 2005, gsw: 2005},
+  {y: 2015, ghsl: 2015, gsw: 2015},
+  {y: 2021, ghsl: 2020, gsw: 2021}
+];
+// Samples per class (1..5) PER EPOCH. Roughly proportional to real cover so
+// rare classes (Built_Up, Water) are not over-predicted.
+var CLASS_POINTS = [400, 1000, 600, 500, 150];
+// GHSL built_surface is m2 of buildings per 100 m cell (max 10000)
+var BUILT_MIN = 3500;    // >= 35 % built  -> Built_Up training label
+var BUILT_NONE = 300;    // <= 3 %  built  -> allowed as non-built label
+
+// OPTIONAL: your own independent validation points (properties: year, class)
+var MODEL = 'RF';                 // 'RF' or 'GTB' - pick the one with better
+                                  // block-wise accuracy in the printed table
+var APPLY_TEMPORAL_RULE = true;   // false = keep raw per-year classification
+var VALIDATION_ASSET = null;   // e.g. 'projects/sarsij/assets/darbhanga_validation'
+
+var CLASS_NAMES = ['Water_Wetlands', 'Agriculture', 'Built_Up',
+                   'Trees_Vegetation', 'Barren_Fallow', 'Other'];
+var PALETTE = ['1f78b4', 'ffd92f', 'e31a1c', '33a02c', 'd2b48c', '969696'];
+var CLASS_KEYS = ['1', '2', '3', '4', '5', '6'];
+
+// ---------------------------- 1. STUDY AREA --------------------------
+//ar aoi = ee.FeatureCollection("projects/sarsij/assets/Darbhanga_Shapefile");
+var geom = aoi.geometry().dissolve(100);
+print('AOI features', aoi.size());
+print('AOI area km2 (Census ~2,279)', geom.area(100).divide(1e6));
+Map.centerObject(geom, 9);
+
+// ---------------------------- 2. LANDSAT PREP ------------------------
+var STD = ['B', 'G', 'R', 'N', 'S1', 'S2'];
+// ETM+ -> OLI coefficients (Roy et al. 2016); verify against the paper.
+var SLOPE = ee.Image.constant([0.8474, 0.8483, 0.9047, 0.8462, 0.8937, 0.9071]);
+var INTER = ee.Image.constant([0.0003, 0.0088, 0.0061, 0.0412, 0.0254, 0.0172]);
+
+function qaMask(img, bits) {
+  var qa = img.select('QA_PIXEL');
+  var m = img.select('QA_RADSAT').eq(0);
+  bits.forEach(function (b) { m = m.and(qa.bitwiseAnd(1 << b).eq(0)); });
+  return m;
+}
+function prepTM(img) {
+  var sr = img.select(['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7'], STD)
+    .multiply(0.0000275).add(-0.2);
+  sr = sr.multiply(SLOPE).add(INTER).clamp(0, 1);
+  return sr.updateMask(qaMask(img, [1, 3, 4])).copyProperties(img, ['system:time_start']);
+}
+function prepOLI(img) {
+  var sr = img.select(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'], STD)
+    .multiply(0.0000275).add(-0.2).clamp(0, 1);
+  return sr.updateMask(qaMask(img, [1, 2, 3, 4])).copyProperties(img, ['system:time_start']);
+}
+function lsCol(period) {
+  var tm = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+    .merge(ee.ImageCollection('LANDSAT/LE07/C02/T1_L2'))
+    .filterDate(period[0], period[1]).filterBounds(geom).map(prepTM);
+  var oli = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'))
+    .filterDate(period[0], period[1]).filterBounds(geom).map(prepOLI);
+  return tm.merge(oli);
+}
+
+// ---------------------------- 3. FEATURE STACK -----------------------
+function featureStack(col) {
+  var all = col.median();
+  var parts = Object.keys(SEASONS).map(function (name) {
+    var r = SEASONS[name];
+    var sc = col.filter(ee.Filter.calendarRange(r[0], r[1], 'month'));
+    var sm = ee.Image(ee.Algorithms.If(sc.size().gt(0), sc.median(), all));
+    var med = ee.ImageCollection([all, sm]).mosaic();   // gaps <- period median
+    var ndvi = med.normalizedDifference(['N', 'R']).rename('NDVI');
+    var mndwi = med.normalizedDifference(['G', 'S1']).rename('MNDWI');
+    var ndbi = med.normalizedDifference(['S1', 'N']).rename('NDBI');
+    var img = med.addBands([ndvi, mndwi, ndbi]);
+    return img.rename(img.bandNames().map(function (b) {
+      return ee.String(name).cat('_').cat(b);
+    }));
+  });
+  var s = ee.Image.cat(parts);
+  var nd = s.select('.*_NDVI'), mw = s.select('.*_MNDWI'), nb = s.select('.*_NDBI');
+  var ndMax = nd.reduce(ee.Reducer.max()).rename('NDVI_max');
+  var ndMin = nd.reduce(ee.Reducer.min()).rename('NDVI_min');
+  var ndMean = nd.reduce(ee.Reducer.mean()).rename('NDVI_mean');
+  var nbMean = nb.reduce(ee.Reducer.mean()).rename('NDBI_mean');
+  var mwMax = mw.reduce(ee.Reducer.max()).rename('MNDWI_max');
+  return s.addBands([ndMax, ndMin, ndMax.subtract(ndMin).rename('NDVI_amp'),
+                     nbMean, mwMax, nbMean.subtract(ndMean).rename('BUI')]);
+}
+
+var stacks = {};
+[1995, 2005, 2015, 2021, 2025].forEach(function (y) {
+  stacks[y] = featureStack(lsCol(PERIODS[y]));
+});
+
+// Scene counts - CHECK THESE (a very low count = noisy composite)
+[1995, 2005, 2015, 2021, 2025].forEach(function (y) {
+  var c = lsCol(PERIODS[y]);
+  var cnt = {total: c.size()};
+  Object.keys(SEASONS).forEach(function (s) {
+    cnt[s] = c.filter(ee.Filter.calendarRange(SEASONS[s][0], SEASONS[s][1], 'month')).size();
+  });
+  print('Landsat scene counts, window ' + PERIODS[y][0].slice(0, 4) + '-' +
+        PERIODS[y][1].slice(0, 4), ee.Dictionary(cnt));
+});
+
+// ---------------------------- 4. TIME-MATCHED LABELS -----------------
+var wc = ee.ImageCollection('ESA/WorldCover/v200').first().select('Map');
+var hansen = ee.Image('UMD/hansen/global_forest_change_2023_v1_11');
+var stableTree = hansen.select('treecover2000').gte(20).and(hansen.select('loss').eq(0));
+
+// If either of the next two lines errors ("is an Image" / "not found"),
+// check the dataset page in the GEE catalog for the exact asset ID.
+function ghsl(year) {
+  return ee.ImageCollection('JRC/GHSL/P2023A/GHS_BUILT_S')
+    .filterDate(year + '-01-01', (year + 1) + '-01-01').first().select('built_surface');
+}
+function gsw(year) {
+  return ee.ImageCollection('JRC/GSW1_4/YearlyHistory')
+    .filterDate(year + '-01-01', (year + 1) + '-01-01').first().select('waterClass');
+}
+
+function labelImage(e) {
+  var bs = ghsl(e.ghsl);
+  var wcl = gsw(e.gsw);                       // 0 nodata, 1 not water, 2 seasonal, 3 permanent
+  var isBuilt = bs.gte(BUILT_MIN);
+  var notBuilt = bs.lte(BUILT_NONE);
+  var isWater = wcl.gte(2);
+  var notWater = wcl.lt(2);                   // keeps 'no data' (patchy in 1995)
+  var lab = ee.Image(0)
+    .where(wc.eq(60).and(notBuilt).and(notWater), 5)
+    .where(wc.eq(10).and(stableTree).and(notBuilt).and(notWater), 4)
+    .where(isBuilt.and(notWater), 3)
+    .where(wc.eq(40).and(notBuilt).and(notWater), 2)
+    .where(isWater.and(notBuilt), 1);
+  return lab.updateMask(lab.gt(0)).rename('class').toInt();
+}
+
+function epochSamples(e) {
+  return stacks[e.y].addBands(labelImage(e)).stratifiedSample({
+    numPoints: 0, classBand: 'class', region: geom, scale: 30,
+    projection: ee.Projection(CRS),
+    classValues: [1, 2, 3, 4, 5], classPoints: CLASS_POINTS,
+    seed: e.y, tileScale: 8, geometries: true
+  }).map(function (f) { return f.set('epoch', e.y); });
+}
+var samples = EPOCHS.map(epochSamples)
+  .reduce(function (a, b) { return a.merge(b); })
+  .randomColumn('rnd', 42);
+// Block-wise hold-out: ~5 km blocks go entirely to train (70 %) or test (30 %),
+// so test points are not right next to training points (less optimistic).
+var withBlock = samples.map(function (f) {
+  var c = ee.List(f.geometry().transform('EPSG:4326', 1).coordinates());
+  var ix = ee.Number(c.get(0)).multiply(20).floor();
+  var iy = ee.Number(c.get(1)).multiply(20).floor();
+  return f.set('blk', ix.multiply(7).add(iy).mod(10));
+});
+var train = withBlock.filter(ee.Filter.lt('blk', 7));
+var test = withBlock.filter(ee.Filter.gte('blk', 7));
+
+// ---------------------------- 5. MODELS ------------------------------
+var inputs = stacks[2021].bandNames();
+function makeModel(name) {
+  if (name === 'GTB') {
+    return ee.Classifier.smileGradientTreeBoost({
+      numberOfTrees: 200, shrinkage: 0.05, samplingRate: 0.7, maxNodes: 64, seed: 42});
+  }
+  return ee.Classifier.smileRandomForest({numberOfTrees: 300, seed: 42, minLeafPopulation: 3});
+}
+function evalModel(name) {
+  var m = makeModel(name).train({features: train, classProperty: 'class', inputProperties: inputs});
+  var tested = test.classify(m);
+  function row(label, t) {
+    var cm = t.errorMatrix('class', 'classification');
+    return ee.Feature(null, {
+      Model: name, Epoch: label, N_test: t.size(),
+      Overall_Accuracy: cm.accuracy(), Kappa: cm.kappa(),
+      BuiltUp_Producers_Acc: cm.producersAccuracy().get([3, 0]),
+      BuiltUp_Users_Acc: cm.consumersAccuracy().get([0, 3]),
+      Water_Producers_Acc: cm.producersAccuracy().get([1, 0]),
+      Water_Users_Acc: cm.consumersAccuracy().get([0, 1])
+    });
+  }
+  var rows = EPOCHS.map(function (e) {
+    return row(String(e.y), tested.filter(ee.Filter.eq('epoch', e.y)));
+  });
+  rows.push(row('ALL', tested));
+  return rows;
+}
+var metricsFC = ee.FeatureCollection(evalModel('RF').concat(evalModel('GTB')));
+print('Block-wise hold-out accuracy, RF vs GTB (vs reference labels, NOT field truth)', metricsFC);
+
+var finalModel = makeModel(MODEL).train({features: withBlock, classProperty: 'class',
+                                         inputProperties: inputs});
+if (MODEL === 'RF') {
+  print('RF feature importance', ee.Dictionary(finalModel.explain().get('importance')));
+}
+
+// ---------------------------- 6. CLASSIFY + TEMPORAL RULE ------------
+function classifyRaw(stack) {
+  return stack.classify(finalModel)
+    .focalMode({radius: 1, units: 'pixels'})
+    .unmask(6)
+    .clip(geom).toUint8().rename('LULC');
+}
+var rawMaps = {};
+YEARS.forEach(function (y) { rawMaps[y] = classifyRaw(stacks[y]); });
+
+var maps = {};
+if (APPLY_TEMPORAL_RULE) {
+  // Best non-decreasing Built_Up series per pixel (5 candidates: built from
+  // 1995, 2005, 2015, 2025, or never). Weights: newer imagery counts more.
+  var W = [1, 1, 1.5, 2];
+  var b = YEARS.map(function (y) { return rawMaps[y].eq(3); });
+  var errs = [0, 1, 2, 3, 4].map(function (k) {
+    var e = ee.Image(0);
+    YEARS.forEach(function (y, j) {
+      e = e.add(b[j].subtract(j >= k ? 1 : 0).abs().multiply(W[j]));
+    });
+    return e;
+  });
+  // pick the candidate with the smallest weighted error (ties keep the earlier one)
+  var bestErr = errs[0];
+  var kBest = ee.Image(0);
+  [1, 2, 3, 4].forEach(function (k) {
+    var better = errs[k].lt(bestErr);
+    kBest = kBest.where(better, k);
+    bestErr = bestErr.min(errs[k]);
+  });
+  YEARS.forEach(function (y, j) {
+    var raw = rawMaps[y];
+    var builtFinal = kBest.lte(j);
+    // pixels removed from Built_Up take the commonest nearby non-built class
+    var fill = raw.updateMask(raw.neq(3)).focalMode({radius: 3, units: 'pixels'}).unmask(2);
+    maps[y] = raw.where(raw.eq(3).and(builtFinal.not()), fill)
+                 .where(builtFinal.and(raw.neq(3)), 3)
+                 .clip(geom).toUint8().rename('LULC');
+  });
+} else {
+  YEARS.forEach(function (y) { maps[y] = rawMaps[y]; });
+}
+
+YEARS.forEach(function (y) {
+  Map.addLayer(rawMaps[y], {min: 1, max: 6, palette: PALETTE}, 'RAW ' + y, false);
+  Map.addLayer(maps[y], {min: 1, max: 6, palette: PALETTE}, 'LULC ' + y + ' (final)', y === 2025);
+});
+var g2020 = ghsl(2020);
+Map.addLayer(g2020.updateMask(g2020.gte(BUILT_MIN)), {palette: ['ff00ff']}, 'GHSL built >=35% (2020)', false);
+
+var rawRows = [];
+YEARS.forEach(function (y) {
+  rawRows = rawRows.concat(areaRows(areaDict(rawMaps[y], 30), 'Landsat_RAW_' + y));
+});
+var rawAreaFC = ee.FeatureCollection(rawRows);
+print('Class area table BEFORE temporal rule', rawAreaFC);
+
+// ---------------------------- 7. AREA + CHANGE TABLES ----------------
+function areaDict(img, scale) {
+  var r = ee.Image.pixelArea().divide(10000).addBands(img.rename('class').toInt())
+    .reduceRegion({
+      reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'class'}),
+      geometry: geom, scale: scale, crs: CRS, maxPixels: 1e13, tileScale: 4
+    });
+  var g = ee.List(r.get('groups'));
+  var keys = g.map(function (x) {
+    return ee.Number(ee.Dictionary(x).get('class')).toInt().format('%d');
+  });
+  var vals = g.map(function (x) { return ee.Dictionary(x).get('sum'); });
+  var d = ee.Dictionary.fromLists(keys, vals);
+  return ee.Dictionary.fromLists(CLASS_KEYS, CLASS_KEYS.map(function (k) {
+    return ee.Number(d.get(k, 0));
+  }));
+}
+function areaRows(dict, label) {
+  var tot = ee.Number(dict.values().reduce(ee.Reducer.sum()));
+  return CLASS_NAMES.map(function (n, i) {
+    var ha = ee.Number(dict.get(CLASS_KEYS[i]));
+    return ee.Feature(null, {
+      Map: label, Class_ID: i + 1, Class_Name: n,
+      Area_ha: ha, Area_km2: ha.divide(100), Percent: ha.divide(tot).multiply(100)
+    });
+  });
+}
+var dicts = {};
+var rows = [];
+YEARS.forEach(function (y) {
+  dicts[y] = areaDict(maps[y], 30);
+  rows = rows.concat(areaRows(dicts[y], 'Landsat_' + y));
+});
+var areaFC = ee.FeatureCollection(rows);
+print('Class area table', areaFC);
+
+var PAIRS = [[1995, 2005], [2005, 2015], [2015, 2025], [1995, 2025]];
+var summaryFC = ee.FeatureCollection(CLASS_NAMES.map(function (n, i) {
+  var k = CLASS_KEYS[i];
+  var p = {Class_ID: i + 1, Class_Name: n};
+  YEARS.forEach(function (y) { p['Area_ha_' + y] = dicts[y].get(k); });
+  PAIRS.forEach(function (pr) {
+    var a = ee.Number(dicts[pr[0]].get(k)), b = ee.Number(dicts[pr[1]].get(k));
+    var tag = pr[0] + '_' + pr[1];
+    p['Change_ha_' + tag] = b.subtract(a);
+    p['Change_pct_' + tag] = b.subtract(a).divide(a).multiply(100);
+    p['Rate_ha_per_yr_' + tag] = b.subtract(a).divide(pr[1] - pr[0]);
+  });
+  return ee.Feature(null, p);
+}));
+print('Change summary', summaryFC);
+
+function changeMatrix(a, b, label) {
+  var code = a.multiply(10).add(b).rename('code').toInt();
+  var r = ee.Image.pixelArea().divide(10000).addBands(code).reduceRegion({
+    reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'code'}),
+    geometry: geom, scale: 30, crs: CRS, maxPixels: 1e13, tileScale: 4
+  });
+  return ee.FeatureCollection(ee.List(r.get('groups')).map(function (g) {
+    g = ee.Dictionary(g);
+    var c = ee.Number(g.get('code')).toInt();
+    var f = c.divide(10).floor().toInt();
+    var t = c.mod(10);
+    return ee.Feature(null, {
+      Period: label, From_ID: f, To_ID: t,
+      From_Class: ee.List(CLASS_NAMES).get(f.subtract(1)),
+      To_Class: ee.List(CLASS_NAMES).get(t.subtract(1)),
+      Area_ha: g.get('sum'), Area_km2: ee.Number(g.get('sum')).divide(100)
+    });
+  }));
+}
+var changeFC = ee.FeatureCollection(PAIRS.map(function (pr) {
+  return changeMatrix(maps[pr[0]], maps[pr[1]], pr[0] + '_' + pr[1]);
+})).flatten();
+
+// ---------------------------- 8. BUILT-UP SANITY CHECK vs GHSL -------
+// GHSL counts building footprints only, so compare the TREND, not the
+// absolute hectares (your Built_Up class also includes yards and roads).
+function ghslHa(year) {
+  return ee.Number(ghsl(year).reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: geom, scale: 100, maxPixels: 1e13
+  }).get('built_surface')).divide(10000);
+}
+var builtCheck = ee.FeatureCollection(YEARS.map(function (y) {
+  var m = ee.Number(dicts[y].get('3'));
+  var r = ee.Number(areaDict(rawMaps[y], 30).get('3'));
+  var g = ghslHa(y);
+  return ee.Feature(null, {
+    Year: y, Map_BuiltUp_ha: m, RAW_BuiltUp_ha_before_rule: r, GHSL_built_ha: g,
+    Map_over_GHSL: m.divide(g),
+    Note: y === 2025 ? 'GHSL 2025 is a model projection, not observed' : 'GHSL epoch'
+  });
+}));
+print('Built_Up: your map vs GHSL (trend should be rising in both)', builtCheck);
+
+// ---------------------------- 9. OPTIONAL INDEPENDENT VALIDATION -----
+if (VALIDATION_ASSET) {
+  var val = ee.FeatureCollection(VALIDATION_ASSET);   // properties: year, class (1-6)
+  YEARS.forEach(function (y) {
+    var s = maps[y].sampleRegions({
+      collection: val.filter(ee.Filter.eq('year', y)),
+      properties: ['class'], scale: 30, tileScale: 4
+    });
+    var cm = s.errorMatrix('class', 'LULC');
+    print('Independent validation ' + y + ' OA', cm.accuracy());
+    print('Independent validation ' + y + ' confusion matrix', cm);
+  });
+}
+
+// ---------------------------- 10. EXPORTS ----------------------------
+if (RUN_EXPORTS) {
+  YEARS.forEach(function (y) {
+    Export.image.toDrive({
+      image: maps[y], description: 'Darbhanga_LULC_' + y + '_Landsat30m_v3',
+      folder: DRIVE_FOLDER, fileNamePrefix: 'Darbhanga_LULC_' + y + '_Landsat30m_v3',
+      region: geom, crs: CRS, scale: 30, maxPixels: 1e13, fileFormat: 'GeoTIFF'
+    });
+  });
+  Export.table.toDrive({collection: rawAreaFC, description: 'Darbhanga_v3_class_area_RAW',
+    folder: DRIVE_FOLDER, fileFormat: 'CSV'});
+  Export.table.toDrive({collection: areaFC, description: 'Darbhanga_v3_class_area',
+    folder: DRIVE_FOLDER, fileFormat: 'CSV'});
+  Export.table.toDrive({collection: summaryFC, description: 'Darbhanga_v3_change_summary',
+    folder: DRIVE_FOLDER, fileFormat: 'CSV'});
+  Export.table.toDrive({collection: changeFC, description: 'Darbhanga_v3_transition_matrices',
+    folder: DRIVE_FOLDER, fileFormat: 'CSV'});
+  Export.table.toDrive({collection: metricsFC, description: 'Darbhanga_v3_model_accuracy',
+    folder: DRIVE_FOLDER, fileFormat: 'CSV'});
+  Export.table.toDrive({collection: builtCheck, description: 'Darbhanga_v3_builtup_vs_GHSL',
+    folder: DRIVE_FOLDER, fileFormat: 'CSV'});
+  Export.table.toDrive({collection: samples, description: 'Darbhanga_v3_training_samples',
+    folder: DRIVE_FOLDER, fileFormat: 'CSV'});
+}
